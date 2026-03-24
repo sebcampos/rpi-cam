@@ -1,6 +1,5 @@
 mod settings;
 
 pub mod db;
-pub mod camera;
-
-
+pub mod opencv_utils;
+pub mod detection;

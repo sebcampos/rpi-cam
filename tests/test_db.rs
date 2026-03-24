@@ -6,7 +6,7 @@ async fn test_get_settings() -> Result<()>
 {
     let db_pool  =  db::create_connection_pool().await?;
     let settings =  db::get_settings(&db_pool).await?;
-    print!("{}", settings.active);
+    print!("Active: {}, Label {}", settings.active, settings.label);
     
     Ok(())
 }

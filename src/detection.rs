@@ -1,10 +1,4 @@
-use opencv::{
-    core,
-    dnn,
-    prelude::*,
-    Result
-};
-
+use opencv::{core, dnn, prelude::*, Result};
 
 #[derive(Debug, Clone)]
 pub struct Detection {
@@ -15,7 +9,7 @@ pub struct Detection {
 
 pub struct Yolo {
     net: dnn::Net,
-    input_size: core::Size,
+    input_size: i32,
     conf_threshold: f32,
     iou_threshold: f32
 }
@@ -23,10 +17,13 @@ pub struct Yolo {
 impl Yolo {
     pub fn new(
         onnx_path: &str,
-        input_size: core::Size,
+        input_size: i32,
         conf_threshold: f32,
         iou_threshold: f32
     ) -> Result<Self> {
+
+        let mut net = dnn::read_net_from_onnx(onnx_path)?;
+
         // CPU:
         net.set_preferable_backend(dnn::DNN_BACKEND_OPENCV)?;
         net.set_preferable_target(dnn::DNN_TARGET_CPU)?;
@@ -42,54 +39,57 @@ impl Yolo {
     }
 
 
-    pub fn predict(&mut self, img_res: Result<core::Mat>) -> Result<Vec<Detection>> {
-        let img = img_res?;
-        if img.emtpy() {
+    pub fn predict(&mut self, img: Mat) -> Result<Vec<Detection>> {
+        if img.empty() {
             return Ok(vec![]);
         }
+
+        let size = core::Size {width: self.input_size, height: self.input_size};
 
         // 1) create block
         // For most YOLO ONNX exports: scale=1/255, swapRB=true, crop=false
         let blob = dnn::blob_from_image(
             &img,
             1.0 / 255.0,
-            self.input_size,
-            Scalar::default(),
+            size,
+            core::VecN([0.0, 0.0, 0.0, 0.0]),
             true,  // swapRB (BGR -> RGB)
             false, // crop
             core::CV_32F
         )?;
 
-        self.net.set_input(&blob, "", 1.0, Scalar::default())?;
+        self.net.set_input(&blob, "", 1.0, core::VecN([0.0, 0.0, 0.0, 0.0]))?;
 
         // 2) Forward
         // Many YOLO ONNX models have a single output. call forward (no idea what forward does)
-        let mut out = self.net.forward("")?;
+        let mut out = Mat::default();
+        let names = core::Vector::<String>::new();
+        let mut out = self.net.forward_single_def()?;
 
         // 3) Parse Detections
         // Support the two common layouts:
         // A) [1, N, 85] (YOLO v5)
         // B) [1, 84, N] or [1, 116, N]
-        let (boxes, scores, class_ids) = parse_yolo_output(&img, &mut out, self.conf_threshold)?;
+        let (boxes, scores, class_ids) = Self::parse_yolo_output(&img, &mut out, self.conf_threshold)?;
 
         // 4) NMS
-        let mut indices = types::VectorOfi32::new();
+        let mut indices =  core::Vector::<i32>::new();
         dnn::nms_boxes(
            &boxes,
            &scores,
            self.conf_threshold,
            self.iou_threshold,
-           &indicies,
+           &mut indices,
            1.0,
            0
         )?;
 
         // 5) Pack results
         let mut dets = Vec::with_capacity(indices.len());
-        for &i in indicies.iter() {
+        for i in indices.iter() {
             dets.push(
                 Detection {
-                    class_id: classids[i as usize],
+                    class_id: class_ids.get(i as usize)?,
                     score: scores.get(i as usize)?,
                     bbox: boxes.get(i as usize)?
                 }
@@ -101,40 +101,82 @@ impl Yolo {
     }
 
     fn parse_yolo_output(
-        img: &core::Mat,
-        out: &mut core::Mat,
+        img: &Mat,
+        out: &mut Mat,
         conf_threshold: f32,
-    ) -> Result<(types::VectorOfRect, types::VectorOff32, Vec<i32>)> {
-        let size = out.mat_size();
-        if size.len() != 3 {
-            anyhow::bail!("2D model is not supported");
-        }
-        
-        let d0 = size[0] as i32;
-        let d1 = size[1] as i32;
-        let d2 = size[2] as i32;
-        // let _ = d0;
-        
-        let img_w = img.cols() as f32;
-        let img_h = img.rows() as f32;
-        
-        let mut boxes = types::VectorOfRect::new();
-        let mut scores = types::VectorOff32::new();
-        let mut class_ids: Vec<i32> = Vec::new();
-        
-        // access raw float data
-        // Ensure output is CV_32F; 
-        if out.typ()? != core:CV_32F {
+    ) -> Result<(core::Vector<core::Rect>, core::Vector<f32>, core::Vector<i32>)> {
+        if out.typ() != core::CV_32F {
             let mut converted = core::Mat::default();
             out.convert_to(&mut converted, core::CV_32F, 1.0, 0.0)?;
             *out = converted;
         }
-        
+
+        let dims = out.dims();
+        if dims != 3 {
+            // anyhow::bail!("Expected 3D YOLO output, got {dims}D");
+        }
+
+        let (d1, d2) = {
+            let size = out.mat_size();
+            (size[1] as usize, size[2] as usize)
+        };
+
+        let img_w = img.cols() as f32;
+        let img_h = img.rows() as f32;
+
+        let mut boxes = core::Vector::<core::Rect>::new();
+        let mut scores = core::Vector::<f32>::new();
+        let mut class_ids = core::Vector::<i32>::new();
+
         let data: &[f32] = unsafe { out.data_typed()? };
-        
-        // Heuristic: if shape is [1, N, M] where M looks like "attrs"
-        // YOLO v5: M = 85 (80)
-        
+
+        let (num_boxes, attrs, transposed) = if d1 > d2 {
+            (d1, d2, false) // [1, N, attrs]
+        } else {
+            (d2, d1, true) // [1, attrs, N]
+        };
+
+        for i in 0..num_boxes {
+            let get = |a: usize| -> f32 {
+                if !transposed {
+                    data[i * attrs + a]
+                } else {
+                    data[a * num_boxes + i]
+                }
+            };
+
+            let cx = get(0);
+            let cy = get(1);
+            let w = get(2);
+            let h = get(3);
+            let obj = get(4);
+
+            let mut best_class = -1;
+            let mut best_score = 0.0f32;
+            for c in 5..attrs {
+                let s = get(c);
+                if s > best_score {
+                    best_score = s;
+                    best_class = (c - 5) as i32;
+                }
+            }
+
+            let conf = obj * best_score;
+            if conf < conf_threshold {
+                continue;
+            }
+
+            let left = ((cx - w * 0.5) * img_w) as i32;
+            let top = ((cy - h * 0.5) * img_h) as i32;
+            let width = (w * img_w) as i32;
+            let height = (h * img_h) as i32;
+
+            boxes.push(core::Rect::new(left, top, width, height));
+            scores.push(conf);
+            class_ids.push(best_class);
+        }
+
+        Ok((boxes, scores, class_ids))
     }
 
 }
