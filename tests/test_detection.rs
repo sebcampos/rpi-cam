@@ -4,7 +4,7 @@ use video_cam::detection::Yolo;
 use video_cam::opencv_utils;
 
 #[tokio::test]
-async fn test_open_camera() -> anyhow::Result<()>
+async fn test_camera_detection() -> anyhow::Result<()>
 {
     let mut camera = opencv_utils::open_camera()?;
     let mut frame = opencv_utils::get_frame(&mut camera)?;
